@@ -1,4 +1,4 @@
-"""DeepEye 审查修复回归测试（基于审查报告声明 1-11 新增）。
+"""OpenEye 审查修复回归测试（基于审查报告声明 1-11 新增）。
 
 覆盖：
 - 声明 1: 工具失败经 server.call_tool 返回 isError=True
@@ -23,12 +23,15 @@ import httpx
 import pytest
 from mcp.types import CallToolResult
 
-from deepeye_mcp.config import settings
-from deepeye_mcp.errors import VisionError
-from deepeye_mcp.image_utils import load_image_from_url_as_base64, parse_image_source, preprocess_image
-from deepeye_mcp.server import call_tool
-from deepeye_mcp.tools import analyze_images, extract_text
-from deepeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
+from openeye_mcp.config import settings
+from openeye_mcp.image_utils import (
+    load_image_from_url_as_base64,
+    parse_image_source,
+    preprocess_image,
+)
+from openeye_mcp.server import call_tool
+from openeye_mcp.tools import analyze_images, extract_text
+from openeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
 
 _PUBLIC_IP = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
 
@@ -53,7 +56,7 @@ async def test_call_tool_failure_sets_is_error():
         ("ask_about_image", {"image_source": "/nonexistent/nope.png", "question": "q"}),
         ("extract_table", {"image_source": "/nonexistent/nope.png"}),
     ]:
-        with patch("deepeye_mcp.tools.create_vision_adapter") as mf:
+        with patch("openeye_mcp.tools.create_vision_adapter") as mf:
             mf.side_effect = RuntimeError("boom")
             result = await call_tool(None, _params(_name=name, **args))
         assert isinstance(result, CallToolResult)
@@ -67,49 +70,39 @@ async def test_call_tool_failure_sets_is_error():
 
 
 async def test_redirect_to_internal_rejected():
-    """公网 URL 重定向到内网时应被拒绝（每跳复检）。"""
-    seen_urls = []
+    """公网 URL 重定向到内网时应被拒绝（每一跳都重新解析 + 校验 + 固定 IP）。"""
+    checked: list[str] = []
 
-    class _Stream:
-        def __init__(self, resp):
-            self._resp = resp
+    async def _fake_pin(url: str):
+        checked.append(url)
+        if "127.0.0.1" in url:
+            raise ValueError("拒绝访问非公网地址（SSRF 防护）: 127.0.0.1 (127.0.0.1)")
+        return "https://93.184.216.34/x.png", "example.com", 443
 
-        async def __aenter__(self):
-            return self._resp
-
-        async def __aexit__(self, *exc_info):
-            return False
-
-    def _redirect_response():
-        fr = MagicMock()
-        fr.status_code = 301
-        # httpx.Headers 不区分大小写；用真实 Headers 构造
-        fr.headers = httpx.Headers({"Location": "http://127.0.0.1:8080/internal.png"})
-        return fr
-
-    def fake_stream(method, url, *a, **k):
-        seen_urls.append(url)
-        return _Stream(_redirect_response())
+    redirect = MagicMock()
+    redirect.status_code = 301
+    # httpx.Headers 不区分大小写，用真实 Headers 构造
+    redirect.headers = httpx.Headers({"Location": "http://127.0.0.1:8080/internal.png"})
+    redirect.aclose = AsyncMock()
 
     fc = AsyncMock()
-    fc.stream = MagicMock(side_effect=fake_stream)
+    fc.build_request = MagicMock(return_value=MagicMock())
+    fc.send = AsyncMock(return_value=redirect)
     fc.__aenter__.return_value = fc
     fc.__aexit__.return_value = None
 
-    # 第一次校验通过、第二次（重定向目标）抛错；手动逻辑应拒绝
-    with patch("deepeye_mcp.image_utils._ensure_public_target") as m_ensure:
-        m_ensure.side_effect = [
-            None,
-            ValueError("拒绝访问非公网地址（SSRF 防护）: 127.0.0.1 (127.0.0.1)"),
-        ]
-        with patch("deepeye_mcp.image_utils.httpx.AsyncClient", return_value=fc):
-            with pytest.raises(ValueError, match="SSRF"):
-                await load_image_from_url_as_base64("https://example.com/x.png")
+    with patch(
+        "openeye_mcp.image_utils._pin_public_address",
+        new=AsyncMock(side_effect=_fake_pin),
+    ) as m_pin, patch("openeye_mcp.image_utils.httpx.AsyncClient", return_value=fc):
+        with pytest.raises(ValueError, match="SSRF"):
+            await load_image_from_url_as_base64("https://example.com/x.png")
 
-    # 校验函数对初始 URL 和重定向目标都被调用
-    ensure_calls = m_ensure.call_count
-    assert ensure_calls >= 2, f"应逐跳校验（初始+重定向目标），实际 {ensure_calls} 次"
-    assert seen_urls == ["https://example.com/x.png"], "重定向目标不应被实际请求"
+    assert checked == [
+        "https://example.com/x.png",
+        "http://127.0.0.1:8080/internal.png",
+    ], "应逐跳校验：初始 URL 与重定向目标都要过一遍"
+    assert m_pin.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +110,10 @@ async def test_redirect_to_internal_rejected():
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
-async def test_extract_text_uses_ocr_backend_provider(mock_factory):
-    """extract_text 应按 settings.ocr_backend 指定 provider。"""
-    monkeypatch = None
-    from deepeye_mcp.config import settings as _s
-    _s.ocr_backend = "gemini"
+@patch("openeye_mcp.tools.create_vision_adapter")
+async def test_extract_text_uses_ocr_backend_provider(mock_factory, monkeypatch):
+    """extract_text 应按 settings.active_ocr_backend 指定 provider。"""
+    monkeypatch.setattr(settings, "ocr_backend", "gemini")
     adapter = MagicMock()
     adapter.describe = AsyncMock(return_value="OCR 结果")
     mock_factory.return_value = adapter
@@ -150,10 +141,10 @@ async def test_gemini_json_object_maps_mime_type():
         })
         return fr
 
-    with patch("deepeye_mcp.config.settings.gemini_api_key", "k"):
-        with patch("deepeye_mcp.config.settings.request_timeout", 5):
-            with patch("deepeye_mcp.config.settings.max_retries", 0):
-                with patch("deepeye_mcp.vision.gemini_adapter._get_client") as m:
+    with patch("openeye_mcp.config.settings.gemini_api_key", "k"):
+        with patch("openeye_mcp.config.settings.request_timeout", 5):
+            with patch("openeye_mcp.config.settings.max_retries", 0):
+                with patch("openeye_mcp.vision.gemini_adapter._get_client") as m:
                     m.return_value.post = fake_post
                     adapter = GeminiVisionAdapter(model="gemini-x", api_key="k")
                     await adapter.describe(
@@ -176,10 +167,10 @@ async def test_gemini_no_format_no_mime_type():
         })
         return fr
 
-    with patch("deepeye_mcp.config.settings.gemini_api_key", "k"):
-        with patch("deepeye_mcp.config.settings.request_timeout", 5):
-            with patch("deepeye_mcp.config.settings.max_retries", 0):
-                with patch("deepeye_mcp.vision.gemini_adapter._get_client") as m:
+    with patch("openeye_mcp.config.settings.gemini_api_key", "k"):
+        with patch("openeye_mcp.config.settings.request_timeout", 5):
+            with patch("openeye_mcp.config.settings.max_retries", 0):
+                with patch("openeye_mcp.vision.gemini_adapter._get_client") as m:
                     m.return_value.post = fake_post
                     adapter = GeminiVisionAdapter(model="gemini-x", api_key="k")
                     await adapter.describe("b64", "image/png", "p")
@@ -210,12 +201,12 @@ async def test_analyze_images_concurrency_bounded():
     adapter = MagicMock()
     adapter.describe = slow_describe
     adapter.describe_text = AsyncMock(return_value="s")
-    with patch("deepeye_mcp.tools.create_vision_adapter", return_value=adapter):
-        with patch("deepeye_mcp.tools.preprocess_image", side_effect=lambda b, m: (b, m)):
-            with patch("deepeye_mcp.tools.parse_image_source",
+    with patch("openeye_mcp.tools.create_vision_adapter", return_value=adapter):
+        with patch("openeye_mcp.tools.preprocess_image", side_effect=lambda b, m: (b, m)):
+            with patch("openeye_mcp.tools.parse_image_source",
                        side_effect=lambda s: (base64.b64encode(b"x").decode(), "image/png")):
                 r = await analyze_images(["d1"] * 12)
-    from deepeye_mcp.tools import _ANALYZE_IMAGES_CONCURRENCY
+    from openeye_mcp.tools import _ANALYZE_IMAGES_CONCURRENCY
     assert peak <= _ANALYZE_IMAGES_CONCURRENCY, f"并发峰值 {peak} > 上限 {_ANALYZE_IMAGES_CONCURRENCY}"
     assert "[1] d1: x" in r[0].text
 
@@ -233,7 +224,6 @@ async def test_data_uri_too_large_rejected(monkeypatch):
 
 
 async def test_local_path_too_large_rejected(monkeypatch, tmp_path):
-    from pathlib import Path
     monkeypatch.setattr(settings, "max_image_bytes", 10)
     p = tmp_path / "big.png"
     p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
@@ -249,6 +239,7 @@ async def test_local_path_too_large_rejected(monkeypatch, tmp_path):
 async def test_exif_rotation_applied(monkeypatch):
     """带 EXIF Orientation=6 (Rotate 90 CW) 的图片应被转正。"""
     import base64 as b64mod
+
     from PIL import Image
 
     monkeypatch.setattr(settings, "image_max_dim", 2048)
@@ -274,7 +265,8 @@ async def test_exif_rotation_applied(monkeypatch):
 def test_gemini_uses_module_client():
     """Gemini 适配器应通过 _get_client 复用模块级 client，而非每次新建。"""
     import inspect
-    from deepeye_mcp.vision import gemini_adapter
+
+    from openeye_mcp.vision import gemini_adapter
     src = inspect.getsource(gemini_adapter.GeminiVisionAdapter.describe)
     assert "AsyncClient()" not in src, "describe 不应再新建 AsyncClient"
     assert "_get_client()" in src
@@ -286,7 +278,7 @@ def test_gemini_uses_module_client():
 
 
 async def test_analyze_layout_invalid_detail_is_error():
-    with patch("deepeye_mcp.tools.create_vision_adapter") as mf:
+    with patch("openeye_mcp.tools.create_vision_adapter") as mf:
         mf.side_effect = RuntimeError("should not be called")
         r = await call_tool(None, _params(
             _name="analyze_layout", image_source="data:image/png;base64,AAA", detail="garbage"
@@ -296,7 +288,7 @@ async def test_analyze_layout_invalid_detail_is_error():
 
 
 async def test_analyze_images_empty_is_error():
-    with patch("deepeye_mcp.tools.create_vision_adapter") as mf:
+    with patch("openeye_mcp.tools.create_vision_adapter") as mf:
         mf.side_effect = RuntimeError("should not be called")
         r = await call_tool(None, _params(_name="analyze_images", image_sources=[]))
     assert r.is_error is True
@@ -304,7 +296,7 @@ async def test_analyze_images_empty_is_error():
 
 
 async def test_analyze_layout_valid_detail_ok():
-    with patch("deepeye_mcp.tools.create_vision_adapter") as mf:
+    with patch("openeye_mcp.tools.create_vision_adapter") as mf:
         adapter = MagicMock()
         adapter.describe = AsyncMock(return_value='{"layout_type":"x"}')
         mf.return_value = adapter

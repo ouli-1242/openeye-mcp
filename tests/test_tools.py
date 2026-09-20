@@ -1,6 +1,6 @@
-"""``deepeye_mcp.tools`` MCP 工具函数单元测试。
+"""``openeye_mcp.tools`` MCP 工具函数单元测试。
 
-通过 ``unittest.mock.patch`` 替换 ``deepeye_mcp.tools.create_vision_adapter``，
+通过 ``unittest.mock.patch`` 替换 ``openeye_mcp.tools.create_vision_adapter``，
 避免任何真实 API 调用；使用 data URI 作为图像源，避免本地文件/网络 IO。
 """
 
@@ -12,10 +12,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp.types import TextContent
 
-from deepeye_mcp.cache import vision_cache
-from deepeye_mcp.config import settings
-from deepeye_mcp.errors import VisionError
-from deepeye_mcp.tools import (
+from openeye_mcp.cache import vision_cache
+from openeye_mcp.config import settings
+from openeye_mcp.errors import VisionError
+from openeye_mcp.tools import (
     _DEFAULT_DESCRIBE_PROMPT,
     _OCR_PROMPT,
     analyze_images,
@@ -33,6 +33,10 @@ def _build_mock_adapter(return_value: str = "mocked description") -> MagicMock:
     """构造一个 mock 适配器，其 ``describe`` 是 AsyncMock 返回固定字符串。"""
     adapter = MagicMock()
     adapter.describe = AsyncMock(return_value=return_value)
+    # 真实适配器带 model / base_url 属性且视觉缓存指纹依赖它们；mock 也必须稳定，
+    # 否则两个「等价」mock 的 str() 不同，缓存命中用例会假阴性
+    adapter.model = "mock-model"
+    adapter.base_url = "https://mock.invalid"
     return adapter
 
 
@@ -41,7 +45,7 @@ def _build_mock_adapter(return_value: str = "mocked description") -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools._run_vision")
+@patch("openeye_mcp.tools._run_vision")
 async def test_extract_text_error_message_is_plain_string(mock_run_vision):
     """classify_error 返回元组，文案必须取 [1]，不能把元组直接格式化。"""
     mock_run_vision.side_effect = FileNotFoundError("图像文件不存在: /tmp/nope.png")
@@ -55,7 +59,7 @@ async def test_extract_text_error_message_is_plain_string(mock_run_vision):
     assert "', '" not in message, f"文案泄漏了元组字面量: {message}"
 
 
-@patch("deepeye_mcp.tools._run_vision")
+@patch("openeye_mcp.tools._run_vision")
 async def test_describe_image_error_message_is_plain_string(mock_run_vision):
     mock_run_vision.side_effect = FileNotFoundError("图像文件不存在: /tmp/nope.png")
 
@@ -70,10 +74,10 @@ async def test_describe_image_error_message_is_plain_string(mock_run_vision):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_cache_reused_for_same_provider(mock_factory, monkeypatch):
     """同一后端 + 同一参数：第二次应命中缓存，后端只被调用一次。"""
-    from deepeye_mcp.tools import _run_vision
+    from openeye_mcp.tools import _run_vision
 
     monkeypatch.setattr(settings, "cache_enabled", True)
     adapter = _build_mock_adapter("结果")
@@ -85,10 +89,10 @@ async def test_cache_reused_for_same_provider(mock_factory, monkeypatch):
     assert adapter.describe.await_count == 1
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_cache_isolated_per_provider(mock_factory, monkeypatch):
     """切换 provider 必须重新调用后端，不得返回旧后端的结果。"""
-    from deepeye_mcp.tools import _run_vision
+    from openeye_mcp.tools import _run_vision
 
     monkeypatch.setattr(settings, "cache_enabled", True)
     adapter = _build_mock_adapter("结果")
@@ -100,10 +104,10 @@ async def test_cache_isolated_per_provider(mock_factory, monkeypatch):
     assert adapter.describe.await_count == 2
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_cache_isolated_per_max_tokens(mock_factory, monkeypatch):
     """仅 max_tokens 变化也必须重新调用后端。"""
-    from deepeye_mcp.tools import _run_vision
+    from openeye_mcp.tools import _run_vision
 
     monkeypatch.setattr(settings, "cache_enabled", True)
     adapter = _build_mock_adapter("结果")
@@ -120,7 +124,7 @@ async def test_cache_isolated_per_max_tokens(mock_factory, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_describe_image_default_prompt(mock_factory):
     mock_adapter = _build_mock_adapter()
     mock_factory.return_value = mock_adapter
@@ -140,7 +144,7 @@ async def test_describe_image_default_prompt(mock_factory):
     assert "mocked description" in result[0].text
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_describe_image_custom_prompt(mock_factory):
     mock_adapter = _build_mock_adapter()
     mock_factory.return_value = mock_adapter
@@ -154,7 +158,7 @@ async def test_describe_image_custom_prompt(mock_factory):
     assert call.args[2] == "描述图表数据趋势"
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_describe_image_custom_model(mock_factory):
     """model 参数应透传给工厂函数。"""
     mock_adapter = _build_mock_adapter()
@@ -162,10 +166,10 @@ async def test_describe_image_custom_model(mock_factory):
 
     await describe_image(image_source=_DATA_URI, model="gpt-4o-mini")
 
-    mock_factory.assert_called_once_with("gpt-4o-mini", provider=None)
+    mock_factory.assert_called_once_with("gpt-4o-mini", provider="openai")
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_describe_image_result_format(mock_factory):
     mock_adapter = _build_mock_adapter(return_value="hello world")
     mock_factory.return_value = mock_adapter
@@ -180,7 +184,7 @@ async def test_describe_image_result_format(mock_factory):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_extract_text_default_no_language_hint(mock_factory):
     mock_adapter = _build_mock_adapter()
     mock_factory.return_value = mock_adapter
@@ -196,7 +200,7 @@ async def test_extract_text_default_no_language_hint(mock_factory):
     assert result[0].text == "mocked description"
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_extract_text_with_language_zh(mock_factory):
     mock_adapter = _build_mock_adapter()
     mock_factory.return_value = mock_adapter
@@ -207,7 +211,7 @@ async def test_extract_text_with_language_zh(mock_factory):
     assert call.args[2] == _OCR_PROMPT + " 优先识别语言：zh"
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_extract_text_with_language_en(mock_factory):
     mock_adapter = _build_mock_adapter()
     mock_factory.return_value = mock_adapter
@@ -223,7 +227,7 @@ async def test_extract_text_with_language_en(mock_factory):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_ask_about_image_prompt_assembly(mock_factory):
     mock_adapter = _build_mock_adapter()
     mock_factory.return_value = mock_adapter
@@ -247,7 +251,7 @@ async def test_ask_about_image_prompt_assembly(mock_factory):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_cache_enabled_second_call_hits_cache(mock_factory, monkeypatch):
     """开启缓存后，第二次相同调用应命中缓存，不再次调用适配器。"""
     monkeypatch.setattr(settings, "cache_enabled", True)
@@ -270,7 +274,7 @@ async def test_cache_enabled_second_call_hits_cache(mock_factory, monkeypatch):
     vision_cache.clear()
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_cache_disabled_calls_adapter_each_time(mock_factory, monkeypatch):
     """关闭缓存时，每次调用都应触发适配器。"""
     monkeypatch.setattr(settings, "cache_enabled", False)
@@ -287,7 +291,7 @@ async def test_cache_disabled_calls_adapter_each_time(mock_factory, monkeypatch)
     vision_cache.clear()
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_cache_different_prompt_does_not_hit(mock_factory, monkeypatch):
     """相同图片但不同 prompt 应产生不同 key，缓存不命中。"""
     monkeypatch.setattr(settings, "cache_enabled", True)
@@ -305,7 +309,7 @@ async def test_cache_different_prompt_does_not_hit(mock_factory, monkeypatch):
     vision_cache.clear()
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_cache_returns_cached_text_directly(mock_factory, monkeypatch):
     """缓存命中时应直接返回缓存文本（未经适配器重新生成）。"""
     monkeypatch.setattr(settings, "cache_enabled", True)
@@ -332,7 +336,7 @@ async def test_cache_returns_cached_text_directly(mock_factory, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_basic(mock_factory):
     """basic 模式：mock 返回纯 JSON，验证返回 list[TextContent] 且 text 是 JSON 字符串。"""
     mock_adapter = _build_mock_adapter(
@@ -352,7 +356,7 @@ async def test_analyze_layout_basic(mock_factory):
     assert parsed["elements"] == []
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_detailed(mock_factory):
     """detailed 模式：mock 返回含 styles 的 JSON，验证 prompt 中包含样式相关指令。"""
     mock_adapter = _build_mock_adapter(
@@ -378,7 +382,7 @@ async def test_analyze_layout_detailed(mock_factory):
     assert parsed["elements"][0]["styles"]["background_color"] == "#fff"
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_json_with_text(mock_factory):
     """模型返回 "说明文字 + JSON" 时应能提取出 JSON。"""
     mock_adapter = _build_mock_adapter(
@@ -396,7 +400,7 @@ async def test_analyze_layout_json_with_text(mock_factory):
     assert parsed["layout_type"] == "nav"
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_no_json(mock_factory):
     """模型未返回 JSON 时应抛 VisionError（含 "未返回有效 JSON" 文案）。"""
     mock_adapter = _build_mock_adapter(return_value="我无法分析")
@@ -406,7 +410,7 @@ async def test_analyze_layout_no_json(mock_factory):
         await analyze_layout(image_source=_DATA_URI)
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_exception(mock_factory):
     """适配器抛异常时应抛 VisionError（含 "布局分析失败" 文案）。"""
     mock_adapter = MagicMock()
@@ -417,7 +421,7 @@ async def test_analyze_layout_exception(mock_factory):
         await analyze_layout(image_source=_DATA_URI)
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_prompt_basic(mock_factory):
     """basic 模式 prompt 不应包含样式相关字段（styles / color）。"""
     mock_adapter = _build_mock_adapter(
@@ -433,7 +437,7 @@ async def test_analyze_layout_prompt_basic(mock_factory):
     assert "color" not in prompt
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_prompt_detailed(mock_factory):
     """detailed 模式 prompt 应包含样式相关字段（styles / color）。"""
     mock_adapter = _build_mock_adapter(
@@ -453,7 +457,7 @@ async def test_analyze_layout_prompt_detailed(mock_factory):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_describe_image_config_error_classified(mock_factory):
     """配置缺失类错误应抛 VisionError 并含「配置错误」提示。"""
     mock_adapter = MagicMock()
@@ -466,7 +470,7 @@ async def test_describe_image_config_error_classified(mock_factory):
         await describe_image(image_source=_DATA_URI)
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_layout_backend_error_has_status(mock_factory):
     """后端 429 错误应抛含限流提示的 VisionError。"""
     import httpx
@@ -488,7 +492,7 @@ async def test_analyze_layout_backend_error_has_status(mock_factory):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_extract_table_returns_markdown(mock_factory):
     mock_adapter = _build_mock_adapter(
         return_value='{"columns":2,"title":"t","rows":['
@@ -503,7 +507,7 @@ async def test_extract_table_returns_markdown(mock_factory):
     assert "| a | 1 |" in result[0].text
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_extract_table_merged_appends_json(mock_factory):
     mock_adapter = _build_mock_adapter(
         return_value='{"columns":1,"title":"","rows":['
@@ -518,7 +522,7 @@ async def test_extract_table_merged_appends_json(mock_factory):
     assert '"rowspan": 2' in result[0].text
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_extract_table_invalid_json_degraded(mock_factory):
     mock_adapter = _build_mock_adapter(return_value="无法识别")
     mock_factory.return_value = mock_adapter
@@ -532,8 +536,8 @@ async def test_extract_table_invalid_json_degraded(mock_factory):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.tools.parse_image_source")
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.parse_image_source")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_images_two_images(mock_factory, mock_parse):
     """两张图并发：逐图结果 + 一次纯文本汇总。"""
     mock_parse.return_value = ("iVBOR", "image/png")
@@ -553,8 +557,8 @@ async def test_analyze_images_two_images(mock_factory, mock_parse):
     adapter.describe_text.assert_awaited_once()
 
 
-@patch("deepeye_mcp.tools.parse_image_source")
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.parse_image_source")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_images_isolated_failure(mock_factory, mock_parse):
     """单张失败不阻塞整体，返回分类后的占位文本。"""
     mock_parse.return_value = ("iVBOR", "image/png")
@@ -571,7 +575,7 @@ async def test_analyze_images_isolated_failure(mock_factory, mock_parse):
     assert "汇总" in text
 
 
-@patch("deepeye_mcp.tools.create_vision_adapter")
+@patch("openeye_mcp.tools.create_vision_adapter")
 async def test_analyze_images_empty_list(mock_factory):
     mock_factory.return_value = _build_mock_adapter()
 
@@ -587,7 +591,7 @@ async def test_analyze_images_empty_list(mock_factory):
 
 def test_server_tools_registered():
     """server 应注册 extract_table 与 analyze_images。"""
-    from deepeye_mcp.server import _TOOLS
+    from openeye_mcp.server import _TOOLS
 
     names = {t.name for t in _TOOLS}
     assert "extract_table" in names

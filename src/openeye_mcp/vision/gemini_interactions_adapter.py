@@ -11,29 +11,17 @@
 
 from __future__ import annotations
 
-import httpx
-
-from deepeye_mcp.config import settings
-from deepeye_mcp.vision._retry import post_with_retry
-from deepeye_mcp.vision.base import VisionAdapter
+from openeye_mcp.vision._http import get_client as _get_client
+from openeye_mcp.vision._retry import post_with_retry
+from openeye_mcp.vision.base import VisionAdapter, VisionOptions
 
 _DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-
-# 复用单个 AsyncClient
-_client: httpx.AsyncClient | None = None
-
-
-def _get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=settings.request_timeout)
-    return _client
 
 
 def _extract_steps_text(steps: list | None) -> str:
     """从 Interactions 响应 steps 时间线中提取文本。
 
-    steps 元素：``{"type": "model_output", "content": [{"type": "text", "text": "..."}]}``、
+    steps 元素：``{"type": "model_output", "content": [...]}``、
     ``{"type": "user_input", ...}``、``{"type": "function_call", ...}`` 等。
     只取 model_output 里 text 内容，跳过 thinking 等。
     """
@@ -64,45 +52,51 @@ class GeminiInteractionsAdapter(VisionAdapter):
     （与 generateContent 同一 Google 账号），仅协议不同。
     """
 
-    def __init__(
-        self,
-        model: str | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
-    ) -> None:
-        self.model = model or settings.gemini_model
-        self.api_key = api_key if api_key is not None else settings.gemini_api_key
-        base = base_url if base_url is not None else settings.gemini_base_url
-        self.base_url = (
-            base.strip() if base and base.strip() else _DEFAULT_BASE_URL
-        )
+    settings_prefix = "gemini"
+    default_base_url = _DEFAULT_BASE_URL
+
+    @property
+    def _url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/interactions"
 
     def _build_payload(
         self,
         image_b64: str,
         mime_type: str,
         prompt: str,
-        max_tokens: int | None,
-        response_format: dict | None,
+        options: VisionOptions,
+        *,
+        with_image: bool = True,
     ) -> dict:
         """构造 Interactions API payload。
 
         - input 数组：图片 block + 文本 message
         - ``store=false``：临时图片不留存在 Google 服务端
         - JSON 输出：``response_format`` 数组（application/json）
+        - token 上限：``max_output_tokens``。历史缺陷是收下调用方传的
+          ``max_tokens`` 却从不写进 payload，布局/表格的 8192 被静默丢弃、
+          配置默认值也一并失效；字段名按本协议与 Responses 同族
+          （``model`` / ``input`` / ``store`` 均为顶层字段）推断。
         """
-        input_items: list[dict] = [
-            {"type": "image", "data": image_b64, "mime_type": mime_type},
-            {"type": "text", "text": prompt},
-        ]
+        input_items: list[dict] = []
+        if with_image:
+            input_items.append(
+                {"type": "image", "data": image_b64, "mime_type": mime_type}
+            )
+        input_items.append({"type": "text", "text": prompt})
         payload: dict = {
             "model": self.model,
             "input": input_items,
             "store": False,
+            "max_output_tokens": options.max_tokens,
         }
-        if response_format and response_format.get("type") == "json_object":
+        if options.wants_json:
             payload["response_format"] = [
-                {"type": "text", "mime_type": "application/json", "schema": {"type": "object"}}
+                {
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": {"type": "object"},
+                }
             ]
         return payload
 
@@ -115,45 +109,41 @@ class GeminiInteractionsAdapter(VisionAdapter):
         reasoning_effort: str | None = None,
         response_format: dict | None = None,
     ) -> str:
-        """调用 Gemini Interactions API 返回图像描述文本。
+        """调用 Gemini Interactions API 返回图像理解文本。
 
         Args:
-            max_tokens: 输出 token 上限覆盖；None 时使用 ``settings.max_tokens``。
+            max_tokens: 输出 token 上限覆盖；None 时用 ``settings.max_tokens``。
             reasoning_effort: 忽略（Interactions 无此参数）。
             response_format: 输出格式约束（如 ``{"type": "json_object"}``）。
 
         Raises:
             httpx.HTTPStatusError: API 返回非 2xx 状态码时抛出。
         """
-        url = f"{self.base_url.rstrip('/')}/interactions"
-        params = {"key": self.api_key}
         payload = self._build_payload(
-            image_b64, mime_type, prompt, max_tokens, response_format
+            image_b64,
+            mime_type,
+            prompt,
+            VisionOptions.resolve(max_tokens, reasoning_effort, response_format),
         )
-        headers = {"Content-Type": "application/json"}
-
-        client = _get_client()
         response = await post_with_retry(
-            client, url, json=payload, headers=headers, params=params
+            _get_client(),
+            self._url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            params={"key": self.api_key},
         )
-
-        data = response.json()
-        return _extract_steps_text(data.get("steps"))
+        return _extract_steps_text(response.json().get("steps"))
 
     async def describe_text(self, prompt: str) -> str:
         """纯文本请求：input 只有文本，无图片。"""
-        url = f"{self.base_url.rstrip('/')}/interactions"
-        params = {"key": self.api_key}
-        payload = {
-            "model": self.model,
-            "input": [{"type": "text", "text": prompt}],
-            "store": False,
-        }
-        headers = {"Content-Type": "application/json"}
-
-        client = _get_client()
-        response = await post_with_retry(
-            client, url, json=payload, headers=headers, params=params
+        payload = self._build_payload(
+            "", "", prompt, VisionOptions.resolve(), with_image=False
         )
-        data = response.json()
-        return _extract_steps_text(data.get("steps"))
+        response = await post_with_retry(
+            _get_client(),
+            self._url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            params={"key": self.api_key},
+        )
+        return _extract_steps_text(response.json().get("steps"))

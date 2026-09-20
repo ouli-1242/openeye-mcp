@@ -1,5 +1,5 @@
 """表格 JSON → Markdown 转换单元测试。"""
-from deepeye_mcp.table import has_merged_cells, json_to_markdown
+from openeye_mcp.table import has_merged_cells, json_to_markdown
 
 
 def test_simple_table():

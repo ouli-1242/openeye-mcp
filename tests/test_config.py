@@ -1,4 +1,4 @@
-"""``deepeye_mcp.config.Settings`` 单元测试。
+"""``openeye_mcp.config.Settings`` 单元测试。
 
 覆盖默认值、环境变量覆盖，以及历史缺陷回归：
 ``.env.example`` 曾提到 ``GEMINI_BASE_URL``，但配置类没有对应字段，
@@ -8,7 +8,7 @@ pydantic 的 ``extra="ignore"`` 会静默丢弃，导致自建代理/兼容网�
 
 from __future__ import annotations
 
-from deepeye_mcp.config import Settings, settings
+from openeye_mcp.config import Settings, settings
 
 
 def test_defaults_are_empty_for_all_api_keys():
@@ -25,7 +25,8 @@ def test_default_values():
     config = Settings(_env_file=None)
 
     assert config.vision_provider == "openai"
-    assert config.ocr_backend == "openai"
+    assert config.ocr_backend is None  # 未显式配置 = 跟随 vision_provider
+    assert config.active_ocr_backend == "openai"
     assert config.max_retries == 3
     assert config.retry_backoff == 0.5
     assert config.request_timeout == 120.0
@@ -48,8 +49,8 @@ def test_env_override(monkeypatch):
 
 def test_gemini_base_url_reaches_both_gemini_adapters(monkeypatch):
     """GEMINI_BASE_URL 必须真正透传到两个 Gemini 适配器（回归）。"""
-    from deepeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
-    from deepeye_mcp.vision.gemini_interactions_adapter import (
+    from openeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
+    from openeye_mcp.vision.gemini_interactions_adapter import (
         GeminiInteractionsAdapter,
     )
 
@@ -69,7 +70,7 @@ def test_gemini_base_url_reaches_both_gemini_adapters(monkeypatch):
 
 def test_explicit_base_url_argument_wins(monkeypatch):
     """显式传入的 base_url 优先级高于配置。"""
-    from deepeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
+    from openeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
 
     monkeypatch.setattr(settings, "gemini_base_url", "https://from-settings/v1beta")
 

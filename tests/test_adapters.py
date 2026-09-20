@@ -12,10 +12,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from deepeye_mcp.config import settings
-from deepeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
-from deepeye_mcp.vision.openai_adapter import OpenAIVisionAdapter
-
+from openeye_mcp.config import settings
+from openeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
+from openeye_mcp.vision.openai_adapter import OpenAIVisionAdapter
 
 # ---------------------------------------------------------------------------
 # 辅助：构造 fake httpx.AsyncClient
@@ -55,7 +54,7 @@ def _make_error_client(response: MagicMock) -> AsyncMock:
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.vision.gemini_adapter._get_client")
+@patch("openeye_mcp.vision.gemini_adapter._get_client")
 async def test_gemini_describe_returns_text(mock_client_cls):
     """describe 应返回 candidates[0].content.parts[0].text（去空白）。"""
     payload = {
@@ -74,7 +73,7 @@ async def test_gemini_describe_returns_text(mock_client_cls):
     assert text == "一只橘猫坐在窗台上"
 
 
-@patch("deepeye_mcp.vision.gemini_adapter._get_client")
+@patch("openeye_mcp.vision.gemini_adapter._get_client")
 async def test_gemini_describe_payload_and_url(mock_client_cls):
     """验证 URL 拼接、query 参数与 payload 结构。"""
     payload = {
@@ -107,6 +106,9 @@ async def test_gemini_describe_payload_and_url(mock_client_cls):
 
     # payload 结构
     sent_payload = call.kwargs.get("json")
+    # 修复回归：maxOutputTokens 恒按解析后的默认值下发（历史缺陷：只有调用方
+    # 显式传了 max_tokens 才写该字段，settings.max_tokens 对 Gemini 无效）
+    assert sent_payload.pop("generationConfig") == {"maxOutputTokens": 4096}
     assert sent_payload == {
         "contents": [
             {
@@ -119,7 +121,7 @@ async def test_gemini_describe_payload_and_url(mock_client_cls):
     }
 
 
-@patch("deepeye_mcp.vision.gemini_adapter._get_client")
+@patch("openeye_mcp.vision.gemini_adapter._get_client")
 async def test_gemini_describe_raises_on_error_status(mock_client_cls):
     """非 2xx 响应应通过 raise_for_status 抛 HTTPStatusError。"""
     fake_response = MagicMock()
@@ -155,7 +157,7 @@ def test_gemini_reads_settings_defaults(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@patch("deepeye_mcp.vision.gemini_adapter._get_client")
+@patch("openeye_mcp.vision.gemini_adapter._get_client")
 async def test_gemini_describe_text(mock_get_client):
     """Gemini describe_text 走 generateContent，parts 仅含 text。"""
     payload = {"candidates": [{"content": {"parts": [{"text": "summary"}]}}]}
@@ -187,7 +189,7 @@ def _make_openai_client(payload: dict) -> AsyncMock:
     return fake_client
 
 
-@patch("deepeye_mcp.vision.openai_adapter._get_client")
+@patch("openeye_mcp.vision.openai_adapter._get_client")
 async def test_openai_describe_choices_null_degraded(mock_get_client):
     """choices 为 None 时应返回空串而不是抛 TypeError。"""
     mock_get_client.return_value = _make_openai_client({"choices": None})
@@ -202,7 +204,7 @@ async def test_openai_describe_choices_null_degraded(mock_get_client):
     assert text == ""
 
 
-@patch("deepeye_mcp.vision.openai_adapter._get_client")
+@patch("openeye_mcp.vision.openai_adapter._get_client")
 async def test_openai_describe_choices_empty_array_degraded(mock_get_client):
     """choices 为空数组时应返回空串而不是抛 IndexError。"""
     mock_get_client.return_value = _make_openai_client({"choices": []})
@@ -217,7 +219,7 @@ async def test_openai_describe_choices_empty_array_degraded(mock_get_client):
     assert text == ""
 
 
-@patch("deepeye_mcp.vision.openai_adapter._get_client")
+@patch("openeye_mcp.vision.openai_adapter._get_client")
 async def test_openai_describe_text_choices_null_degraded(mock_get_client):
     """describe_text 遇到 choices=None 时返回空串而不是抛异常。"""
     mock_get_client.return_value = _make_openai_client({"choices": None})

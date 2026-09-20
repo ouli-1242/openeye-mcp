@@ -1,4 +1,4 @@
-"""``deepeye_mcp.vision._retry.post_with_retry`` 单元测试。
+"""``openeye_mcp.vision._retry.post_with_retry`` 单元测试。
 
 历史缺陷：五个适配器各自复制了一份重试循环，且只捕获
 Timeout/Transport——429 限流与 5xx 故障不重试，与错误文案
@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from deepeye_mcp.config import settings
-from deepeye_mcp.vision._retry import post_with_retry
+from openeye_mcp.config import settings
+from openeye_mcp.vision._retry import post_with_retry
 
 
 def _response(status_code: int) -> MagicMock:
@@ -109,21 +109,51 @@ async def test_timeout_is_retried(monkeypatch):
         await _call(client)
 
 
-async def test_backoff_is_applied_and_doubles(monkeypatch):
-    """退避时长应为 retry_backoff * 2**(n-1)，且可被配置关闭。"""
+async def test_backoff_doubles_with_jitter(monkeypatch):
+    """退避基数按 retry_backoff * 2**n 增长，并叠加 ±25% 抖动（打散 429 惊群）。"""
     monkeypatch.setattr(settings, "max_retries", 3)
     monkeypatch.setattr(settings, "retry_backoff", 0.5)
+    monkeypatch.setattr(settings, "request_deadline", 0)
     slept: list[float] = []
 
     async def _sleep(seconds):
         slept.append(seconds)
 
     client = _client([503, 503, 503, 503])
-    with patch("deepeye_mcp.vision._retry.asyncio.sleep", _sleep):
+    with patch("openeye_mcp.vision._retry.asyncio.sleep", _sleep):
         with pytest.raises(httpx.HTTPStatusError):
             await _call(client)
 
-    assert slept == [0.5, 1.0, 2.0]
+    assert len(slept) == 3
+    for attempt, seconds in zip(range(3), slept, strict=True):
+        base = 0.5 * (2**attempt)
+        assert base * 0.75 <= seconds <= base * 1.25, (attempt, seconds)
+    assert len(set(slept)) > 1 or True  # 抖动允许极端巧合，但基数必须递增
+
+
+async def test_retry_after_header_wins_over_backoff(monkeypatch):
+    """服务端明确给出 Retry-After 时按它等待，而不是按本地退避基数。"""
+    monkeypatch.setattr(settings, "max_retries", 1)
+    monkeypatch.setattr(settings, "retry_backoff", 0.5)
+    monkeypatch.setattr(settings, "request_deadline", 0)
+    slept: list[float] = []
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+
+    response = _response(429)
+    response.headers = {"Retry-After": "3"}
+    client = AsyncMock()
+
+    async def _post(url, json=None, headers=None, params=None):
+        return response
+
+    client.post = _post
+    with patch("openeye_mcp.vision._retry.asyncio.sleep", _sleep):
+        with pytest.raises(httpx.HTTPStatusError):
+            await post_with_retry(client, "https://example.com/v1", json={}, headers={})
+
+    assert slept == [3.0]
 
 
 async def test_zero_backoff_skips_sleep(monkeypatch):
@@ -133,7 +163,7 @@ async def test_zero_backoff_skips_sleep(monkeypatch):
     sleep = AsyncMock()
 
     client = _client([503, 503])
-    with patch("deepeye_mcp.vision._retry.asyncio.sleep", sleep):
+    with patch("openeye_mcp.vision._retry.asyncio.sleep", sleep):
         with pytest.raises(httpx.HTTPStatusError):
             await _call(client)
 

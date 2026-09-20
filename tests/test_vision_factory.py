@@ -1,13 +1,13 @@
-"""``deepeye_mcp.vision`` 工厂函数 ``create_vision_adapter`` 单元测试。"""
+"""``openeye_mcp.vision`` 工厂函数 ``create_vision_adapter`` 单元测试。"""
 
 from __future__ import annotations
 
 import pytest
 
-from deepeye_mcp.config import settings
-from deepeye_mcp.vision import create_vision_adapter
-from deepeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
-from deepeye_mcp.vision.openai_adapter import OpenAIVisionAdapter
+from openeye_mcp.config import settings
+from openeye_mcp.vision import create_vision_adapter
+from openeye_mcp.vision.gemini_adapter import GeminiVisionAdapter
+from openeye_mcp.vision.openai_adapter import OpenAIVisionAdapter
 
 
 def test_create_vision_adapter_openai_default(monkeypatch):

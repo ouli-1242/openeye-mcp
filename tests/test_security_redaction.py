@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from deepeye_mcp.errors import VisionError, classify_error
+from openeye_mcp.errors import VisionError, classify_error
 
 
 def _status_error(url: str, status: int = 401) -> httpx.HTTPStatusError:
@@ -117,7 +117,7 @@ def test_vision_error_is_not_reclassified():
 )
 def test_image_source_errors_classified_as_image(message):
     """image_utils 的所有来源错误都应归入 image，而非 unknown。"""
-    from deepeye_mcp.errors import ImageSourceError
+    from openeye_mcp.errors import ImageSourceError
 
     category, _ = classify_error(ImageSourceError(message))
 

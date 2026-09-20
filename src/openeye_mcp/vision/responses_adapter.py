@@ -6,6 +6,7 @@
 - 图片用 ``input_image`` block（``{"type": "input_image", "image_url": "data:..."}``）
 - 响应 ``output`` 是类型化 Item 数组，需遍历找 ``type=="message"`` 的文本
 - 结构化输出走 ``text.format``（json_schema）
+- token 上限是 ``max_output_tokens``，推理深度是顶层 ``reasoning.effort``
 
 第三方 OpenAI 兼容厂商大多实现 Chat Completions 而非 Responses，
 本适配器主要面向 OpenAI / Azure 官方端点。
@@ -13,21 +14,11 @@
 
 from __future__ import annotations
 
-import httpx
+from openeye_mcp.vision._http import get_client as _get_client
+from openeye_mcp.vision._retry import post_with_retry
+from openeye_mcp.vision.base import VisionAdapter, VisionOptions
 
-from deepeye_mcp.config import settings
-from deepeye_mcp.vision._retry import post_with_retry
-from deepeye_mcp.vision.base import VisionAdapter
-
-# 复用单个 AsyncClient
-_client: httpx.AsyncClient | None = None
-
-
-def _get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=settings.request_timeout)
-    return _client
+_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
 def _extract_output_text(output: list | None) -> str:
@@ -61,26 +52,21 @@ class ResponsesVisionAdapter(VisionAdapter):
         base_url: 接口地址，未指定时使用 ``settings.responses_base_url``。
     """
 
-    def __init__(
-        self,
-        model: str | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
-    ) -> None:
-        self.model = model or settings.responses_model
-        self.api_key = api_key if api_key is not None else settings.responses_api_key
-        base = base_url if base_url is not None else settings.responses_base_url
-        base = (base or "").strip()
-        self.base_url = base if base else "https://api.openai.com/v1"
+    settings_prefix = "responses"
+    default_base_url = _DEFAULT_BASE_URL
+
+    @property
+    def _url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/responses"
 
     def _build_payload(
         self,
         image_b64: str,
         mime_type: str,
         prompt: str,
-        max_tokens: int | None,
-        reasoning_effort: str | None,
-        response_format: dict | None,
+        options: VisionOptions,
+        *,
+        with_image: bool = True,
     ) -> dict:
         """构造 Responses API payload。
 
@@ -88,17 +74,26 @@ class ResponsesVisionAdapter(VisionAdapter):
         - 结构化输出：``text.format``（json_schema）
         - reasoning_effort：顶层 ``reasoning`` 的 ``effort``
         """
-        data_uri = f"data:{mime_type};base64,{image_b64}"
+        text_block: dict = {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+        }
+        blocks: list[dict] = []
+        if with_image:
+            blocks.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime_type};base64,{image_b64}",
+                }
+            )
+        blocks.append(text_block)
         payload: dict = {
             "model": self.model,
-            "input": [
-                {"type": "input_image", "image_url": data_uri},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]},
-            ],
-            "max_output_tokens": max_tokens if max_tokens is not None else settings.max_tokens,
+            "input": blocks,
+            "max_output_tokens": options.max_tokens,
         }
-        # 结构化输出：openai 式 json_object -> text.format (json_schema)
-        if response_format and response_format.get("type") == "json_object":
+        if options.wants_json:
             payload["text"] = {
                 "format": {
                     "type": "json_schema",
@@ -107,10 +102,8 @@ class ResponsesVisionAdapter(VisionAdapter):
                     "schema": {"type": "object"},
                 }
             }
-        # 推理深度：reasoning.effort（low/medium/high）
-        effort = reasoning_effort or settings.reasoning_effort
-        if effort:
-            payload["reasoning"] = {"effort": effort}
+        if options.reasoning_effort:
+            payload["reasoning"] = {"effort": options.reasoning_effort}
         return payload
 
     async def describe(
@@ -122,37 +115,28 @@ class ResponsesVisionAdapter(VisionAdapter):
         reasoning_effort: str | None = None,
         response_format: dict | None = None,
     ) -> str:
-        """调用 OpenAI Responses API 返回图像描述文本。"""
-        url = f"{self.base_url.rstrip('/')}/responses"
+        """调用 OpenAI Responses API 返回图像理解文本。
+
+        Raises:
+            httpx.HTTPStatusError: API 返回非 2xx 状态码时抛出。
+        """
         payload = self._build_payload(
-            image_b64, mime_type, prompt, max_tokens,
-            reasoning_effort, response_format,
+            image_b64,
+            mime_type,
+            prompt,
+            VisionOptions.resolve(max_tokens, reasoning_effort, response_format),
         )
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        client = _get_client()
-        response = await post_with_retry(client, url, json=payload, headers=headers)
-
-        data = response.json()
-        return _extract_output_text(data.get("output"))
+        response = await post_with_retry(
+            _get_client(), self._url, json=payload, headers=self.bearer_headers()
+        )
+        return _extract_output_text(response.json().get("output"))
 
     async def describe_text(self, prompt: str) -> str:
         """纯文本请求：input 只有文本，无图片。"""
-        url = f"{self.base_url.rstrip('/')}/responses"
-        payload: dict = {
-            "model": self.model,
-            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-            "max_output_tokens": settings.max_tokens,
-        }
-        if settings.reasoning_effort:
-            payload["reasoning"] = {"effort": settings.reasoning_effort}
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        client = _get_client()
-        response = await post_with_retry(client, url, json=payload, headers=headers)
-        data = response.json()
-        return _extract_output_text(data.get("output"))
+        payload = self._build_payload(
+            "", "", prompt, VisionOptions.resolve(), with_image=False
+        )
+        response = await post_with_retry(
+            _get_client(), self._url, json=payload, headers=self.bearer_headers()
+        )
+        return _extract_output_text(response.json().get("output"))

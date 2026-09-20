@@ -2,8 +2,8 @@
 
 import pytest
 
-from deepeye_mcp.cache import vision_cache
-from deepeye_mcp.config import settings
+from openeye_mcp.cache import prepared_image_cache, vision_cache
+from openeye_mcp.config import settings
 
 
 @pytest.fixture(autouse=True)
@@ -11,8 +11,10 @@ def _disable_cache():
     """每个测试前禁用缓存并清空，避免测试间互相干扰。"""
     settings.cache_enabled = False
     vision_cache.clear()
+    prepared_image_cache.clear()
     yield
     vision_cache.clear()
+    prepared_image_cache.clear()
 
 
 @pytest.fixture(autouse=True)

@@ -3,7 +3,9 @@
 视觉模型负责读表并输出结构化 JSON，本模块负责确定性的格式转换。
 """
 
-_TABLE_JSON_PROMPT = """
+from __future__ import annotations
+
+TABLE_JSON_PROMPT = """
 分析这张图片中的表格，输出 JSON。只返回 JSON，不加任何说明文字。
 JSON 格式：
 {"columns": 列数, "title": "表格标题或空串", "rows": [{"cells": [{"text": "单元格内容", "rowspan": 1, "colspan": 1}]}]}

@@ -1,8 +1,7 @@
 """classify_error 错误分类单元测试。"""
 import httpx
-import pytest
 
-from deepeye_mcp.errors import classify_error
+from openeye_mcp.errors import classify_error
 
 
 def _http_error(status: int) -> httpx.HTTPStatusError:

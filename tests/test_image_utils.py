@@ -1,4 +1,4 @@
-"""``deepeye_mcp.image_utils`` 单元测试。
+"""``openeye_mcp.image_utils`` 单元测试。
 
 覆盖三种图像来源（本地文件 / 公网 URL / Base64 data URI）的解析逻辑，
 URL 下载通过 mock ``httpx.AsyncClient`` 避免真实网络 IO。
@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from deepeye_mcp.config import settings
-from deepeye_mcp.image_utils import (
+from openeye_mcp.config import settings
+from openeye_mcp.image_utils import (
     _parse_data_uri,
     load_image_as_base64,
     load_image_from_url_as_base64,
@@ -109,7 +109,7 @@ _PUBLIC_IP = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
 
 
 class _FakeStream:
-    """``client.stream(...)`` 的异步上下文管理器替身。"""
+    """下载响应的替身：支持 ``aiter_bytes`` 流式读取与 ``aclose``。"""
 
     def __init__(self, response: MagicMock) -> None:
         self._response = response
@@ -121,18 +121,30 @@ class _FakeStream:
         return False
 
 
+def _png_bytes(size=(2, 2)) -> bytes:
+    """一张真实可解码的小 PNG（下载路径现在会校验内容确实是图片）。"""
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color=(0, 128, 255)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def _make_fake_response(
     content: bytes,
     content_type: str = "image/png",
     status_code: int = 200,
+    headers: dict | None = None,
 ) -> MagicMock:
     """构造 fake 响应，支持流式下载路径（headers / aiter_bytes）。"""
     fake_response = MagicMock()
     fake_response.status_code = status_code
     fake_response.headers = (
-        {"Content-Type": content_type} if content_type else {}
+        headers if headers is not None
+        else ({"Content-Type": content_type} if content_type else {})
     )
     fake_response.raise_for_status = MagicMock()
+    fake_response.aclose = AsyncMock()
 
     async def _aiter_bytes(chunk_size: int = 65536):
         for i in range(0, len(content), chunk_size):
@@ -147,15 +159,40 @@ def _make_fake_client(
     content_type: str = "image/png",
     *,
     response: MagicMock | None = None,
+    redirect_location: str | None = None,
 ) -> AsyncMock:
     """构造 fake ``httpx.AsyncClient``。
 
-    下载路径现在走 ``client.stream("GET", ...)``（流式 + 边读边限幅），
-    因此替身需要提供 ``stream`` 而非 ``get``。
+    下载路径走 ``build_request`` + ``send(request, stream=True)``：URL 已被
+    改写为校验过的 IP，原主机名靠 ``Host`` 头与 ``sni_hostname`` extension
+    保留。替身按这个契约提供 ``build_request`` / ``send``，并记录发出的请求。
     """
     if response is None:
-        response = _make_fake_response(content, content_type)
+        headers = {"Location": redirect_location} if redirect_location else None
+        status = 302 if redirect_location else 200
+        response = _make_fake_response(
+            content, content_type, status_code=status, headers=headers
+        )
     fake_client = AsyncMock()
+    fake_client.requests: list[MagicMock] = []
+    fake_client.responses: list[MagicMock] = [response]
+
+    def _build_request(method, url, headers=None, **kwargs):
+        request = MagicMock()
+        request.method = method
+        request.url = url
+        request.headers = dict(headers or {})
+        request.extensions = {"timeout": {}}
+        fake_client.requests.append(request)
+        return request
+
+    async def _send(request, stream=False, **kwargs):
+        # 多跳重定向时按「已发出的请求数」取对应响应；单响应时恒取该响应
+        index = min(len(fake_client.requests) - 1, len(fake_client.responses) - 1)
+        return fake_client.responses[index]
+
+    fake_client.build_request = MagicMock(side_effect=_build_request)
+    fake_client.send = AsyncMock(side_effect=_send)
     fake_client.stream = MagicMock(side_effect=lambda *a, **k: _FakeStream(response))
     fake_client.__aenter__.return_value = fake_client
     fake_client.__aexit__.return_value = None
@@ -163,12 +200,13 @@ def _make_fake_client(
 
 
 @patch(
-    "deepeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
+    "openeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
 )
-@patch("deepeye_mcp.image_utils.httpx.AsyncClient")
+@patch("openeye_mcp.image_utils.httpx.AsyncClient")
 async def test_load_image_from_url_as_base64(mock_client_cls, mock_getaddrinfo):
-    raw = b"fake-image-bytes"
-    mock_client_cls.return_value = _make_fake_client(raw, "image/jpeg; charset=utf-8")
+    raw = _png_bytes()
+    client = _make_fake_client(raw, "image/jpeg; charset=utf-8")
+    mock_client_cls.return_value = client
 
     b64_data, mime_type = await load_image_from_url_as_base64(
         "https://example.com/cat.jpg"
@@ -176,17 +214,19 @@ async def test_load_image_from_url_as_base64(mock_client_cls, mock_getaddrinfo):
 
     assert b64_data == base64.b64encode(raw).decode("ascii")
     assert mime_type == "image/jpeg"
-    mock_client_cls.return_value.stream.assert_called_once_with(
-        "GET", "https://example.com/cat.jpg"
-    )
+    # 请求打到已校验的 IP，原主机名靠 Host 头与 sni_hostname 保留（SNI/证书校验不降级）
+    request = client.requests[0]
+    assert request.url == "https://93.184.216.34/cat.jpg"
+    assert request.headers["Host"] == "example.com"
+    assert request.extensions["sni_hostname"] == "example.com"
 
 
 @patch(
-    "deepeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
+    "openeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
 )
-@patch("deepeye_mcp.image_utils.httpx.AsyncClient")
+@patch("openeye_mcp.image_utils.httpx.AsyncClient")
 async def test_load_image_from_url_as_base64_missing_content_type(mock_client_cls, mock_getaddrinfo):
-    raw = b"more-bytes"
+    raw = _png_bytes()
     mock_client_cls.return_value = _make_fake_client(raw, "")
 
     b64_data, mime_type = await load_image_from_url_as_base64(
@@ -198,9 +238,9 @@ async def test_load_image_from_url_as_base64_missing_content_type(mock_client_cl
 
 
 @patch(
-    "deepeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
+    "openeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
 )
-@patch("deepeye_mcp.image_utils.httpx.AsyncClient")
+@patch("openeye_mcp.image_utils.httpx.AsyncClient")
 async def test_load_image_from_url_as_base64_raises_on_error_status(mock_client_cls, mock_getaddrinfo):
     import httpx
 
@@ -224,11 +264,10 @@ async def test_load_image_from_url_as_base64_raises_on_error_status(mock_client_
 async def _assert_ssrf_blocked(host: str, ip: str, url: str) -> None:
     """断言解析到 ``ip`` 的 ``host`` 被 SSRF 防护拒绝。"""
     with patch(
-        "deepeye_mcp.image_utils.socket.getaddrinfo",
+        "openeye_mcp.image_utils.socket.getaddrinfo",
         return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))],
-    ):
-        with pytest.raises(ValueError, match="SSRF"):
-            await load_image_from_url_as_base64(url)
+    ), pytest.raises(ValueError, match="SSRF"):
+        await load_image_from_url_as_base64(url)
 
 
 async def test_url_rejects_localhost_ip():
@@ -252,13 +291,14 @@ async def test_url_rejects_loopback_hostname():
 async def test_allow_private_urls_bypasses_ssrf(monkeypatch):
     """allow_private_urls=True 时跳过 SSRF 校验（仅本地调试）。"""
     monkeypatch.setattr(settings, "allow_private_urls", True)
-    with patch("deepeye_mcp.image_utils.httpx.AsyncClient") as mock_client_cls:
-        mock_client_cls.return_value = _make_fake_client(b"x", "image/png")
+    raw = _png_bytes()
+    with patch("openeye_mcp.image_utils.httpx.AsyncClient") as mock_client_cls:
+        mock_client_cls.return_value = _make_fake_client(raw, "image/png")
         b64_data, mime_type = await load_image_from_url_as_base64(
             "http://127.0.0.1/img.png"
         )
 
-    assert b64_data == base64.b64encode(b"x").decode("ascii")
+    assert b64_data == base64.b64encode(raw).decode("ascii")
     assert mime_type == "image/png"
 
 
@@ -266,18 +306,17 @@ async def test_url_too_large_rejected(monkeypatch):
     """下载内容超过 max_image_bytes 上限时应拒绝。"""
     monkeypatch.setattr(settings, "max_image_bytes", 10)
     with patch(
-        "deepeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
-    ):
-        with patch("deepeye_mcp.image_utils.httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value = _make_fake_client(b"x" * 100, "image/png")
-            with pytest.raises(ValueError, match="大小上限"):
-                await load_image_from_url_as_base64("https://example.com/big.png")
+        "openeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
+    ), patch("openeye_mcp.image_utils.httpx.AsyncClient") as mock_client_cls:
+        mock_client_cls.return_value = _make_fake_client(b"x" * 100, "image/png")
+        with pytest.raises(ValueError, match="大小上限"):
+            await load_image_from_url_as_base64("https://example.com/big.png")
 
 
 @patch(
-    "deepeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
+    "openeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
 )
-@patch("deepeye_mcp.image_utils.httpx.AsyncClient")
+@patch("openeye_mcp.image_utils.httpx.AsyncClient")
 async def test_url_streaming_aborts_before_reading_everything(
     mock_client_cls, mock_getaddrinfo, monkeypatch
 ):
@@ -291,9 +330,9 @@ async def test_url_streaming_aborts_before_reading_everything(
 
 
 @patch(
-    "deepeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
+    "openeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
 )
-@patch("deepeye_mcp.image_utils.httpx.AsyncClient")
+@patch("openeye_mcp.image_utils.httpx.AsyncClient")
 async def test_url_rejects_non_image_content_type(mock_client_cls, mock_getaddrinfo):
     """返回 HTML 错误页（Content-Type: text/html）时应拒绝。
 
@@ -312,11 +351,22 @@ async def test_url_rejects_non_image_content_type(mock_client_cls, mock_getaddri
 # ---------------------------------------------------------------------------
 
 
+def _data_uri() -> str:
+    return "data:image/png;base64," + base64.b64encode(_png_bytes()).decode("ascii")
+
+
 async def test_parse_image_source_data_uri_no_io():
     """``data:`` 前缀走 _parse_data_uri，不进行任何文件/网络 IO。"""
-    b64_data, mime_type = await parse_image_source("data:image/png;base64,ABC")
-    assert b64_data == "ABC"
+    uri = _data_uri()
+    b64_data, mime_type = await parse_image_source(uri)
+    assert b64_data == uri.split(",", 1)[1]
     assert mime_type == "image/png"
+
+
+async def test_parse_image_source_rejects_non_image_data_uri():
+    """data URI 内容不是图片时必须拒绝，否则任意文本都会被送进第三方后端。"""
+    with pytest.raises(ValueError, match="不是可识别的图片"):
+        await parse_image_source("data:image/png;base64,aGVsbG8td29ybGQ=")
 
 
 async def test_parse_image_source_local(tmp_path: Path):
@@ -330,11 +380,11 @@ async def test_parse_image_source_local(tmp_path: Path):
 
 
 @patch(
-    "deepeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
+    "openeye_mcp.image_utils.socket.getaddrinfo", return_value=_PUBLIC_IP
 )
-@patch("deepeye_mcp.image_utils.httpx.AsyncClient")
+@patch("openeye_mcp.image_utils.httpx.AsyncClient")
 async def test_parse_image_source_url(mock_client_cls, mock_getaddrinfo):
-    raw = b"webp-bytes"
+    raw = _png_bytes()
     mock_client_cls.return_value = _make_fake_client(raw, "image/webp")
 
     b64_data, mime_type = await parse_image_source("https://example.com/img.webp")

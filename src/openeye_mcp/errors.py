@@ -1,4 +1,4 @@
-"""DeepEye 错误分类。
+"""OpenEye 错误分类。
 
 把底层异常映射为「分类 + 用户友好的中文提示」，供所有工具统一使用。
 
@@ -47,7 +47,7 @@ class ImageSourceError(ValueError):
 # x-api-key: VALUE / x-goog-api-key=VALUE / authorization: Bearer VALUE
 _HEADER_SECRET_RE = re.compile(
     r"(?i)((?:x-api-key|x-goog-api-key|api-key|authorization)['\"]?\s*[:=]\s*)"
-    r"(?:(?:bearer)\s+)?['\"]?([^\s,'\"}]+)"
+    r"(?:['\"]?bearer['\"]?\s+)?['\"]?([^\s,'\"}]+)"
 )
 # 独立 Bearer VALUE（如 RuntimeError 文案里直接拼了 token）
 _BEARER_SECRET_RE = re.compile(r"(?i)\b(bearer)(\s+)([A-Za-z0-9._\-]{8,})")
@@ -66,8 +66,7 @@ def redact_secrets(text: str) -> str:
         return text
     text = _HEADER_SECRET_RE.sub(rf"\g<1>{_REDACTED}", text)
     text = _BEARER_SECRET_RE.sub(rf"\g<1>\g<2>{_REDACTED}", text)
-    text = _QUERY_SECRET_RE.sub(rf"\g<1>\g<2>{_REDACTED}", text)
-    return text
+    return _QUERY_SECRET_RE.sub(rf"\g<1>\g<2>{_REDACTED}", text)
 
 
 def _backend_tag(provider: str) -> str:
@@ -75,7 +74,7 @@ def _backend_tag(provider: str) -> str:
     return f"后端（{provider}）" if provider else "后端"
 
 
-def classify_error(exc: Exception, provider: str = "") -> tuple[str, str]:
+def classify_error(exc: BaseException, provider: str = "") -> tuple[str, str]:
     """把异常分类为 ``(category, message)``。
 
     Args:
